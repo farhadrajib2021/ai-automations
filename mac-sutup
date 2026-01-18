@@ -1,0 +1,315 @@
+AI Kitchen Printing System
+Full macOS Setup (CUPS + server.js + Cloudflare + n8n Cloud)
+
+This guide sets up a Mac-based kitchen printer that prints orders automatically from n8n Cloud, using a secure Cloudflare Tunnel.
+
+✅ No Raspberry Pi
+✅ No router ports opened
+✅ No tablets in the kitchen
+
+🧩 Architecture (Simple)
+Customer / AI / QR
+        ↓
+     n8n Cloud
+        ↓ HTTPS
+Cloudflare Tunnel (Mac)
+        ↓
+  Print API (server.js)
+        ↓
+     CUPS (macOS)
+        ↓
+   POS Kitchen Printer
+
+🧰 What You Need
+Hardware
+
+Mac mini / MacBook (always on)
+
+POS thermal printer (USB or LAN)
+
+80mm thermal paper
+
+Accounts
+
+Cloudflare account (free)
+
+n8n Cloud account
+
+PART 1 — Printer & CUPS (macOS)
+✅ CUPS on macOS
+
+CUPS is already installed by Apple. No installation needed.
+
+1️⃣ Connect the Printer
+
+USB: plug in and power on
+
+LAN: connect to router
+
+2️⃣ Add Printer in macOS
+
+System Settings → Printers & Scanners → Add Printer
+Driver:
+
+✅ Generic Text-Only Printer
+
+OR Generic ESC/POS
+
+Name it:
+
+kitchen_printer
+
+3️⃣ Test Printing
+lpstat -p
+
+echo "TEST PRINT FROM MAC" | lp -d kitchen_printer
+
+
+✅ If it prints → printer setup is done.
+
+PART 2 — Print API (server.js)
+4️⃣ Install Node.js (Homebrew)
+brew install node
+node -v
+
+5️⃣ Create Print API Project
+mkdir ~/print-api
+cd ~/print-api
+npm init -y
+npm install express
+
+6️⃣ Create server.js (production-ready)
+nano server.js
+
+
+Paste:
+
+const express = require("express");
+const { spawn } = require("child_process");
+
+const app = express();
+app.use(express.text({ type: "*/*" }));
+
+const PRINTER_NAME = "kitchen_printer";
+
+// spacing
+const TOP_FEED = 3;
+const BOTTOM_FEED = 8;
+
+// ESC/POS cut (printer must support cutter)
+const CUT = Buffer.from([0x1d, 0x56, 0x01]); // partial cut
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.post("/print", (req, res) => {
+  const text = (req.body || "").toString();
+  if (!text.trim()) return res.status(400).send("Empty body");
+
+  const payload = Buffer.concat([
+    Buffer.from("\n".repeat(TOP_FEED)),
+    Buffer.from(text),
+    Buffer.from("\n".repeat(BOTTOM_FEED)),
+    CUT
+  ]);
+
+  const lp = spawn("lp", ["-d", PRINTER_NAME, "-o", "raw"]);
+  lp.stdin.write(payload);
+  lp.stdin.end();
+
+  lp.on("close", () => res.json({ ok: true }));
+});
+
+app.listen(3000, () =>
+  console.log("🔥 Print API running on http://localhost:3000")
+);
+
+7️⃣ Test Print API Locally
+
+Terminal 1:
+
+node server.js
+
+
+Terminal 2:
+
+curl -X POST http://localhost:3000/print \
+  -H "Content-Type: text/plain" \
+  --data-binary $'LOCAL TEST\nTable 1\n'
+
+
+✅ Printer should print.
+
+PART 3 — Auto-Start Print API on macOS
+✅ OPTION A (RECOMMENDED): pm2 (simplest & reliable)
+
+pm2 is a Node.js process manager — perfect for production.
+
+Install pm2
+npm install -g pm2
+
+Start your print server with pm2
+cd ~/print-api
+pm2 start server.js --name print-api
+
+Enable auto-start on reboot
+pm2 startup
+
+
+👉 It will print a command — copy & run it.
+
+Then save process list:
+
+pm2 save
+
+Verify pm2 auto-start
+pm2 status
+pm2 logs print-api
+
+Verify port is listening
+lsof -nP -iTCP:3000 -sTCP:LISTEN
+
+
+✅ Now even after reboot:
+
+Print API starts automatically
+
+cloudflared forwards correctly
+
+no more 502 (caused by API being down)
+
+OPTION B: macOS launchd (advanced, more config)
+
+Use this only if you want zero Node tooling. pm2 is easier.
+
+(If you want, I can generate the exact .plist file for you.)
+
+PART 4 — Cloudflare Tunnel (macOS)
+8️⃣ Install Cloudflared
+brew install cloudflare/cloudflare/cloudflare
+
+
+(If your formula name differs, use:)
+
+brew install cloudflare/cloudflare/cloudflared
+
+9️⃣ Login (one time)
+cloudflared tunnel login
+
+🔟 Create Tunnel (one per Mac)
+cloudflared tunnel create mac-printserver
+
+
+You’ll get:
+
+~/.cloudflared/<UUID>.json
+
+1️⃣1️⃣ Configure Tunnel
+nano ~/.cloudflared/config.yml
+
+tunnel: mac-printserver
+credentials-file: /Users/YOUR_USERNAME/.cloudflared/<UUID>.json
+
+ingress:
+  - hostname: print-api.automation-hub.store
+    service: http://127.0.0.1:3000
+  - service: http_status:404
+
+1️⃣2️⃣ Create DNS Route
+cloudflared tunnel route dns mac-printserver print-api.automation-hub.store
+
+1️⃣3️⃣ Auto-Start Cloudflared (LaunchAgent)
+
+Create:
+
+nano ~/Library/LaunchAgents/com.restaurant.cloudflared.plist
+
+
+Paste:
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.restaurant.cloudflared</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/opt/homebrew/bin/cloudflared</string>
+      <string>tunnel</string>
+      <string>run</string>
+      <string>mac-printserver</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/cloudflared.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cloudflared.err.log</string>
+  </dict>
+</plist>
+
+
+Load it:
+
+launchctl load ~/Library/LaunchAgents/com.restaurant.cloudflared.plist
+launchctl start com.restaurant.cloudflared
+
+PART 5 — n8n Cloud Setup
+1️⃣4️⃣ HTTP Request Node
+
+Method:
+
+POST
+
+
+URL:
+
+https://print-api.automation-hub.store/print
+
+
+Headers:
+
+Content-Type: text/plain
+
+
+Body (RAW):
+
+NEUE BESTELLUNG
+------------------------------
+Name: {{ $json.customerName }}
+
+Tisch: {{ $json.tableNumber }}
+
+Bestellung:
+{{ $json.itemsText }}
+
+Zeit: {{ $now }}
+------------------------------
+Restaurant AI
+
+✅ Final “Health Checklist” (use this anytime)
+Tunnel running?
+launchctl list | grep cloudflared
+
+Print API running?
+pm2 status
+
+
+(or fallback)
+
+ps aux | grep server.js
+
+Port listening?
+lsof -nP -iTCP:3000 -sTCP:LISTEN
+
+Local test
+curl http://localhost:3000/health
+
+Public test
+curl https://print-api.automation-hub.store/health
